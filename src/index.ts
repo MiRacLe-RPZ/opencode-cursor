@@ -5,7 +5,11 @@
  * 1. Browser-based OAuth login to Cursor
  * 2. Local proxy translating OpenAI format → Cursor gRPC protocol
  */
-import type { Config, Hooks, Plugin, PluginInput } from "@opencode-ai/plugin/v1";
+import type { Config, Hooks, Plugin, PluginInput, PluginOptions } from "@opencode-ai/plugin/v1";
+
+interface CursorPluginOptions extends PluginOptions {
+  disableHttp2?: boolean;
+}
 import type { Model as ModelV2 } from "@opencode-ai/sdk/v2";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -17,7 +21,7 @@ import {
   refreshCursorToken,
 } from "./auth";
 import { getCursorModels, type CursorModel } from "./models";
-import { startProxy } from "./proxy";
+import { startProxy, CURSOR_DISABLE_HTTP2 } from "./proxy";
 
 const CURSOR_PROVIDER_ID = "cursor";
 
@@ -128,7 +132,9 @@ function buildConfigModels(models: CursorModel[]): ConfigProviderModels {
  */
 export const CursorAuthPlugin: Plugin = async (
   input: PluginInput,
+  options?: CursorPluginOptions,
 ): Promise<Hooks> => {
+  const disableHttp2 = options?.disableHttp2 ?? CURSOR_DISABLE_HTTP2;
   return {
     /**
      * opencode >= 1.18 builds its provider catalog from config + models.dev
@@ -145,7 +151,7 @@ export const CursorAuthPlugin: Plugin = async (
         const accessToken = await resolveDiskAccessToken(input);
         if (!accessToken) return;
 
-        const models = await getCursorModels(accessToken);
+        const models = await getCursorModels(accessToken, disableHttp2);
         const configModels = (cursor.models ??= {});
         for (const [id, model] of Object.entries(buildConfigModels(models))) {
           // User-defined model entries win over discovered ones.
@@ -175,12 +181,12 @@ export const CursorAuthPlugin: Plugin = async (
           accessToken = refreshed.access;
         }
 
-        const models = await getCursorModels(accessToken);
+        const models = await getCursorModels(accessToken, disableHttp2);
         const port = await startProxy(async () => {
           const token = await resolveDiskAccessToken(input);
           if (!token) throw new Error("Cursor auth not configured");
           return token;
-        }, models);
+        }, models, disableHttp2);
         return buildCursorProviderModels(models, port);
       },
     },
@@ -208,7 +214,7 @@ export const CursorAuthPlugin: Plugin = async (
           accessToken = refreshed.access;
         }
 
-        const models = await getCursorModels(accessToken);
+        const models = await getCursorModels(accessToken, disableHttp2);
 
         const port = await startProxy(async () => {
           const currentAuth = await getAuth();
@@ -231,7 +237,7 @@ export const CursorAuthPlugin: Plugin = async (
           }
 
           return currentAuth.access;
-        }, models);
+        }, models, disableHttp2);
 
         if (provider) {
           (provider as any).models = buildCursorProviderModels(models, port);
