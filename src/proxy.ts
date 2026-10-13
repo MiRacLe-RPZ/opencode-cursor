@@ -45,6 +45,7 @@ import {
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
   ReadArgsSchema,
+  ReadFileNotFoundSchema,
   ReadRejectedSchema,
   ReadResultSchema,
   RequestContextResultSchema,
@@ -82,7 +83,7 @@ import { z } from "zod";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve as pathResolve } from "node:path";
+import { isAbsolute, resolve as pathResolve } from "node:path";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
@@ -717,9 +718,12 @@ async function callCursorHttp1(
   }
 }
 
+const BIDI_APPEND_ATTEMPTS = 4;
+
 function createHttp1ClientChannel(
   accessToken: string,
   requestId: string,
+  onFailure: (err: Error) => void,
 ): {
   sendFrame: (data: Uint8Array) => void;
   sendInitial: (data: Uint8Array) => Promise<void>;
@@ -728,18 +732,36 @@ function createHttp1ClientChannel(
 } {
   let appendSeqno = 0;
   let timer: ReturnType<typeof setInterval> | undefined;
-  const post = (data: Uint8Array) => {
-    const seqno = appendSeqno++;
-    return callCursor(
-      accessToken,
-      BIDI_APPEND_PATH,
-      encodeBidiAppendRequest(data, requestId, seqno),
-      { unary: true, timeoutMs: 10_000, requestId },
-    );
+  let stopped = false;
+  // The server applies appends in seqno order, so a lost seqno stalls the turn.
+  const post = async (data: Uint8Array): Promise<void> => {
+    const body = encodeBidiAppendRequest(data, requestId, appendSeqno++);
+    let lastError: unknown;
+    for (let attempt = 0; attempt < BIDI_APPEND_ATTEMPTS && !stopped; attempt++) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
+      try {
+        const response = await callCursor(accessToken, BIDI_APPEND_PATH, body, {
+          unary: true,
+          timeoutMs: 10_000,
+          requestId,
+        });
+        if (response.ok) {
+          await response.arrayBuffer().catch(() => {});
+          return;
+        }
+        lastError = new Error(`BidiAppend failed: ${response.status}`);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    if (stopped) return;
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   };
   const sendFrame = (data: Uint8Array) => {
-    void post(data).catch((err) => {
-      console.error("[proxy] BidiAppend failed:", err instanceof Error ? err.message : err);
+    void post(data).catch((err: Error) => {
+      if (stopped) return;
+      console.error("[proxy] BidiAppend failed:", err.message);
+      onFailure(err);
     });
   };
   const heartbeat = toBinary(
@@ -750,14 +772,12 @@ function createHttp1ClientChannel(
   );
   return {
     sendFrame,
-    async sendInitial(data: Uint8Array) {
-      const response = await post(data);
-      if (!response.ok) throw new Error(`BidiAppend failed: ${response.status}`);
-    },
+    sendInitial: post,
     startHeartbeat() {
       timer = setInterval(() => sendFrame(heartbeat), 5_000);
     },
     stop() {
+      stopped = true;
       if (timer) clearInterval(timer);
     },
   };
@@ -768,6 +788,12 @@ interface StreamState {
   pendingExecs: PendingExec[];
   outputTokens: number;
   totalTokens: number;
+  /** Paths of Cursor edit tool calls in progress, keyed by tool call id. */
+  editPaths: Map<string, string>;
+}
+
+function createStreamState(): StreamState {
+  return { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0, editPaths: new Map() };
 }
 
 function computeUsage(state: StreamState) {
@@ -903,6 +929,7 @@ function processServerMessage(
       cloudRule,
       sendFrame,
       onMcpExec,
+      state.editPaths,
     );
   } else if (msgCase === "interactionQuery") {
     handleInteractionQuery(msg.message.value as InteractionQuery, sendFrame);
@@ -931,6 +958,15 @@ function handleInteractionUpdate(
     if (delta) onText(delta, true);
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
+  } else if (updateCase === "toolCallStarted") {
+    const { callId, toolCall } = update.message.value;
+    if (callId && toolCall?.tool?.case === "editToolCall") {
+      const path = toolCall.tool.value?.args?.path;
+      if (path) state.editPaths.set(callId, path);
+    }
+  } else if (updateCase === "toolCallCompleted") {
+    const callId = update.message.value.callId;
+    if (callId) state.editPaths.delete(callId);
   }
 }
 
@@ -1207,10 +1243,21 @@ function handleExecMessage(
   cloudRule: string | undefined,
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
+  editPaths: Map<string, string> = new Map(),
 ): void {
   const execCase = execMsg.message.case;
   if (process.env.CURSOR_PROXY_DEBUG) {
     console.error(`[proxy] exec: ${execCase}`);
+  }
+
+  // Cursor applies an edit server-side: it reads the file, then sends writeArgs.
+  // Redirecting that read to OpenCode ends the turn and the edit is lost.
+  if (execCase === "readArgs") {
+    const { path, toolCallId } = execMsg.message.value;
+    if (path && isAbsolute(path) && (editPaths.has(toolCallId) || [...editPaths.values()].includes(path))) {
+      void answerEditRead(execMsg, path, sendFrame);
+      return;
+    }
   }
 
   if (execCase === "requestContextArgs") {
@@ -1275,6 +1322,30 @@ function handleExecMessage(
   }
   if (process.env.CURSOR_PROXY_DEBUG) console.error(`[proxy] unhandled exec: ${execCase}`);
   sendExecThrow(execMsg, "This Cursor tool is not available. Use the MCP tools provided instead.", sendFrame);
+}
+
+async function answerEditRead(
+  execMsg: ExecServerMessage,
+  path: string,
+  sendFrame: (data: Uint8Array) => void,
+): Promise<void> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    const result = code === "ENOENT"
+      ? create(ReadResultSchema, { result: { case: "fileNotFound", value: create(ReadFileNotFoundSchema, { path }) } })
+      : create(ReadResultSchema, { result: { case: "rejected", value: create(ReadRejectedSchema, { path, reason: String(code ?? err) }) } });
+    sendExecResult(execMsg, "readResult", result, sendFrame);
+    return;
+  }
+  sendNativeExecResult(
+    { execId: execMsg.execId, execMsgId: execMsg.id },
+    { resultType: "readResult", args: { path } },
+    text,
+    sendFrame,
+  );
 }
 
 function sendExecResult(
@@ -1580,11 +1651,18 @@ async function handleStreamingResponse(
       });
       const makeUsageChunk = () => { const { prompt_tokens, completion_tokens, total_tokens } = computeUsage(state); return { id: completionId, object: "chat.completion.chunk", created, model: modelId, choices: [], usage: { prompt_tokens, completion_tokens, total_tokens } }; };
 
-      const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
+      const state = createStreamState();
       const tagFilter = createThinkingTagFilter();
       let mcpExecReceived = false;
       const requestId = crypto.randomUUID();
-      const http1 = proxyDisableHttp2 ? createHttp1ClientChannel(accessToken, requestId) : undefined;
+      let channelError: Error | undefined;
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      const http1 = proxyDisableHttp2
+        ? createHttp1ClientChannel(accessToken, requestId, (err) => {
+            channelError ??= err;
+            void reader?.cancel(err).catch(() => {});
+          })
+        : undefined;
       const sendFrame = http1?.sendFrame ?? (() => {});
 
       const processChunk = (messageBytes: Uint8Array) => {
@@ -1633,7 +1711,8 @@ async function handleStreamingResponse(
             await http1.sendInitial(payload.requestBytes);
             http1.startHeartbeat();
           }
-          const reader = response.body!.getReader();
+          reader = response.body!.getReader();
+          if (channelError) await reader.cancel(channelError).catch(() => {});
           const parser = createResponseBodyParser(
             response.headers.get("content-type"),
             processChunk,
@@ -1645,6 +1724,7 @@ async function handleStreamingResponse(
             if (done) break;
             parser.push(value);
           }
+          if (channelError) throw channelError;
           parser.flush();
         } catch (e) {
           if (!closed) {
@@ -1687,16 +1767,22 @@ async function collectFullResponse(
   const { promise, resolve } = Promise.withResolvers<{ text: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } }>();
   let fullText = "";
   const requestId = crypto.randomUUID();
-  const http1 = proxyDisableHttp2 ? createHttp1ClientChannel(accessToken, requestId) : undefined;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  const http1 = proxyDisableHttp2
+    ? createHttp1ClientChannel(accessToken, requestId, (err) => {
+        void reader?.cancel(err).catch(() => {});
+      })
+    : undefined;
   const sendFrame = http1?.sendFrame ?? (() => {});
   const response = await callCursor(accessToken, "/agent.v1.AgentService/Run", payload.requestBytes, { requestId });
   if (http1) {
     await http1.sendInitial(payload.requestBytes);
     http1.startHeartbeat();
   }
-  const state: StreamState = { toolCallIndex: 0, pendingExecs: [], outputTokens: 0, totalTokens: 0 };
+  const state = createStreamState();
   const tagFilter = createThinkingTagFilter();
-  const reader = response.body!.getReader();
+  const bodyReader = response.body!.getReader();
+  reader = bodyReader;
   const parser = createResponseBodyParser(
     response.headers.get("content-type"),
     (messageBytes) => {
@@ -1708,7 +1794,7 @@ async function collectFullResponse(
     () => {},
   );
   const pump = async (): Promise<void> => {
-    try { while (true) { const { done, value } = await reader.read(); if (done) break; parser.push(value); } parser.flush(); }
+    try { while (true) { const { done, value } = await bodyReader.read(); if (done) break; parser.push(value); } parser.flush(); }
     catch {}
     finally { http1?.stop(); }
     const stored = conversationStates.get(convKey);
